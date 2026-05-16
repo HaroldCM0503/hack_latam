@@ -1,0 +1,29 @@
+# General
+.DS_Store
+*.log
+.vscode/
+
+# Node (Dashboard)
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+
+# ESP-IDF (Firmware)
+**/build/
+**/managed_components/
+**/dependencies.lock
+**/sdkconfig.old
+**/sdkconfig
+!**/sdkconfig.defaults
+
+# Python (Fusion)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
