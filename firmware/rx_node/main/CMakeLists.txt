@@ -1,7 +1,7 @@
 idf_component_register(
-    SRCS        "main.c"
+    SRCS         "main.c"
     INCLUDE_DIRS "."
-    REQUIRES    nvs_flash esp_wifi esp_event esp_netif lwip
+    REQUIRES     nvs_flash esp_wifi esp_event esp_netif lwip
 )
 
 # Allow setting the board's RX_ID from the idf.py command line, e.g.

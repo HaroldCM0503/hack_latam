@@ -1,17 +1,21 @@
 // WiFi-CSI Tx node (ESP-IDF).
 //
-// Joins the laptop's WiFi AP, then continuously broadcasts ESP-NOW packets
-// (~500 Hz). These packets are what the three Rx nodes will receive in
-// promiscuous mode and extract CSI from. Each broadcast is a fixed-length
-// management/action frame with a stable source MAC, so the Rx can filter.
+// Adopts the espressif/esp-csi `csi_send` pattern:
+//   - Pins a fixed MAC (0x1a:00:00:00:00:00) so every Rx can filter on it
+//     without pasting per-board MACs.
+//   - Locks the ESP-NOW PHY rate to MCS0 + Long GI via esp_now_set_peer_rate_config
+//     for the most CSI-friendly, deterministic preamble training on the Rx side.
+//   - Broadcasts a tiny ESP-NOW payload (a 32-bit sequence counter) at a fixed
+//     rate using usleep, which works regardless of FreeRTOS tick rate.
 //
-// Build/flash (with ESP-IDF environment configured):
+// We additionally associate to the laptop hotspot so the Tx channel automatically
+// matches whatever channel the AP picked — every Rx is on the same channel by
+// virtue of all four nodes joining the same SSID.
+//
+// Build/flash:
+//   cd firmware/tx_node
 //   idf.py set-target esp32
-//   idf.py menuconfig          # (optional, defaults from sdkconfig.defaults)
 //   idf.py build flash monitor
-//
-// Edit WIFI_SSID / WIFI_PASSWORD below before flashing. On first boot the
-// node prints its MAC; copy that into the Rx firmware's TX_MAC constant.
 
 #include <stdio.h>
 #include <string.h>
@@ -20,24 +24,31 @@
 #include "freertos/task.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
-// Internal API used by espressif/esp-csi reference: forces a fixed PHY rate so
-// every packet trains CSI with identical preamble/modulation. Massively
-// improves CSI consistency vs. letting the rate adapter swing.
-#include "esp_private/wifi.h"
-
 // ---------- EDIT FOR YOUR SETUP ----------
-#define WIFI_SSID       "LAPTOP-E9GMR8ST"
-#define WIFI_PASSWORD   "1234567891"
-#define TX_INTERVAL_MS  2          // ~500 Hz packet rate
+#define WIFI_SSID       "debri_net"
+#define WIFI_PASSWORD   "12345678901"
+// Hz, target ESP-NOW broadcast rate.
+// 100 Hz is the espressif/esp-csi csi_send default — comfortably below the
+// radio's TX-buffer drain rate for ESP-NOW broadcasts. Raising this further
+// causes ieee80211_alloc_tx_buf to busy-spin (IDLE TWDT trips). 100 Hz x
+// ~100 ms gate-crossing time still gives 10+ CSI samples per transit, which
+// is plenty for bistatic-Fresnel fitting.
+#define SEND_FREQUENCY  100
 // -----------------------------------------
 
+// Fixed Tx MAC — Rx firmware filters on exactly this value.
+// Matches espressif/esp-csi csi_send convention.
+static const uint8_t TX_MAC[6] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+static const uint8_t BCAST_MAC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
 static const char *TAG = "TX";
-static uint8_t bcast_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -63,36 +74,110 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, &on_wifi_event, NULL, NULL));
 
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    // Pin our STA MAC BEFORE start, so association + every ESP-NOW frame uses it.
+    ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, TX_MAC));
+
     wifi_config_t wc = { 0 };
     strncpy((char*)wc.sta.ssid,     WIFI_SSID,     sizeof(wc.sta.ssid));
     strncpy((char*)wc.sta.password, WIFI_PASSWORD, sizeof(wc.sta.password));
-
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
-    // Disable PS so we transmit on a strict schedule.
+
+    // Power save off — we transmit on a strict cadence.
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    // Note on bandwidth: we don't force HT40 here. The Windows mobile hotspot
+    // advertises BW20, and the STA negotiates down to that anyway. The peer
+    // rate config below uses HT20 to match. If you switch to an HT40-capable
+    // AP, raise both the peer rate's phymode AND uncomment a
+    // esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40) call here.
+
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Max TX power (units of 0.25 dBm; 80 -> 20 dBm = legal max). Stronger
-    // signal means better SNR per CSI sample at all three Rx.
+    // Max legal Tx power (units of 0.25 dBm). Higher SNR at every Rx.
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(80));
-
-    // Force a stable PHY rate so every packet has the same preamble timing
-    // and the Rx side gets coherent LLTF+HT-LTF symbols. MCS0 + Long GI is
-    // the standard CSI-friendly rate used in espressif/esp-csi.
-    ESP_ERROR_CHECK(
-        esp_wifi_internal_set_fix_rate(WIFI_IF_STA, true, WIFI_PHY_RATE_MCS0_LGI));
 }
 
-static void esp_now_init_tx(void) {
+static void wifi_esp_now_init(void) {
     ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)"pmk1234567890123"));
+
     esp_now_peer_info_t peer = { 0 };
-    memcpy(peer.peer_addr, bcast_mac, 6);
-    peer.channel = 0;                       // use the channel of the connected AP
+    memcpy(peer.peer_addr, BCAST_MAC, 6);
+    peer.channel = 0;                       // follow the connected AP's channel
     peer.ifidx   = WIFI_IF_STA;
     peer.encrypt = false;
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+
+    // Lock the peer rate. WIFI_PHY_RATE_MCS0_LGI is the espressif/esp-csi
+    // canonical "CSI-friendly" rate: shortest packets, deterministic timing,
+    // every frame trains LLTF+HT-LTF with identical modulation.
+    //
+    // phymode MUST match the radio's actual bandwidth, which is determined by
+    // the AP we associated to (Windows mobile hotspot is BW20 by default).
+    // Setting HT40 here while the radio is BW20 fails with
+    // ESP_ERR_ESPNOW_ARG ("invalid chanel info, need change second channel
+    // to 40"). HT20 works on both BW20 and BW40 APs.
+    esp_now_rate_config_t rate = {
+        .phymode = WIFI_PHY_MODE_HT20,
+        .rate    = WIFI_PHY_RATE_MCS0_LGI,
+        .ersu    = false,
+        .dcm     = false,
+    };
+    ESP_ERROR_CHECK(esp_now_set_peer_rate_config(BCAST_MAC, &rate));
+}
+
+// ---------- TX loop ----------
+// Runs in its own task pinned to CPU1, so IDLE0 always has CPU0 to run on
+// and reset the task watchdog — even if our task happens to busy-wait inside
+// the Wi-Fi stack's TX-buffer allocator.
+static void tx_task(void *arg) {
+    // Period in FreeRTOS ticks. pdMS_TO_TICKS(10) is at least 1 tick on every
+    // tick rate ESP-IDF ships with (10 @ 1 kHz, 1 @ 100 Hz), so vTaskDelay
+    // never degenerates to a non-sleeping yield.
+    const TickType_t period_ticks  = pdMS_TO_TICKS(1000 / SEND_FREQUENCY);
+    // On send-failure (typically ESP_ERR_ESPNOW_NO_MEM == TX buffer pool full)
+    // we wait noticeably longer before retrying, so the Wi-Fi driver can
+    // drain its queue instead of being slammed again immediately.
+    const TickType_t backoff_ticks = pdMS_TO_TICKS(5);
+
+    uint32_t sent_ok   = 0;
+    uint32_t sent_fail = 0;
+    uint32_t last_log  = 0;
+
+    ESP_LOGI(TAG,
+        "tx_task on CPU%d  configTICK_RATE_HZ=%lu  period_ticks=%lu (~%lu ms)",
+        (int)xPortGetCoreID(),
+        (unsigned long)configTICK_RATE_HZ,
+        (unsigned long)period_ticks,
+        (unsigned long)(period_ticks * portTICK_PERIOD_MS));
+
+    for (uint32_t count = 0; ; ++count) {
+        esp_err_t r = esp_now_send(BCAST_MAC, (const uint8_t *)&count, sizeof(count));
+        if (r == ESP_OK) {
+            sent_ok++;
+            vTaskDelay(period_ticks);
+        } else {
+            sent_fail++;
+            vTaskDelay(backoff_ticks);
+        }
+
+        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (now_ms - last_log > 2000) {
+            uint8_t cur_chan = 0;
+            wifi_second_chan_t sec;
+            esp_wifi_get_channel(&cur_chan, &sec);
+            ESP_LOGI(TAG, "tx ok=%lu fail=%lu cnt=%lu chan=%u rate~%lu Hz",
+                     (unsigned long)sent_ok, (unsigned long)sent_fail,
+                     (unsigned long)count, (unsigned)cur_chan,
+                     (unsigned long)(sent_ok / 2));
+            sent_ok = 0;
+            sent_fail = 0;
+            last_log = now_ms;
+        }
+    }
 }
 
 void app_main(void) {
@@ -104,55 +189,24 @@ void app_main(void) {
 
     wifi_init_sta();
 
-    // Wait until we have IP (best-effort - 5 s)
+    // Best-effort wait for STA to associate so channel/peer-rate apply cleanly.
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    uint8_t mac[6];
-    esp_wifi_get_mac(WIFI_IF_STA, mac);
-    ESP_LOGI(TAG, "Tx MAC = %02X:%02X:%02X:%02X:%02X:%02X  --  paste into rx_node TX_MAC",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-    esp_now_init_tx();
-
-    uint8_t payload[20] = { 'C', 'S', 'I', '-', 'T', 'X' };
-    uint32_t cnt        = 0;
-    uint32_t sent_ok    = 0;
-    uint32_t sent_fail  = 0;
-    uint32_t last_log_t = 0;
+    wifi_esp_now_init();
 
     uint8_t cur_chan = 0;
     wifi_second_chan_t sec;
     esp_wifi_get_channel(&cur_chan, &sec);
-    ESP_LOGI(TAG, "Sending on channel %u, broadcast MAC ff:ff:ff:ff:ff:ff", (unsigned)cur_chan);
+    ESP_LOGI(TAG,
+        "================ CSI SEND ================\n"
+        "  TX_MAC = %02X:%02X:%02X:%02X:%02X:%02X (matches Rx filter)\n"
+        "  channel = %u, target rate = %d Hz, MCS0_LGI",
+        TX_MAC[0], TX_MAC[1], TX_MAC[2], TX_MAC[3], TX_MAC[4], TX_MAC[5],
+        (unsigned)cur_chan, SEND_FREQUENCY);
 
-    while (1) {
-        // Counter in the first 4 bytes makes packets unique on the air
-        // (so radios don't drop them as duplicates).
-        payload[8]  = (cnt >> 24) & 0xff;
-        payload[9]  = (cnt >> 16) & 0xff;
-        payload[10] = (cnt >>  8) & 0xff;
-        payload[11] = (cnt      ) & 0xff;
-        cnt++;
-
-        esp_err_t err = esp_now_send(bcast_mac, payload, sizeof(payload));
-        if (err == ESP_OK) sent_ok++;
-        else               sent_fail++;
-
-        // Every 2 s, log a heartbeat so we can confirm the Tx is alive AND
-        // confirm what rate is actually leaving the chip (failures, channel).
-        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if (now_ms - last_log_t > 2000) {
-            esp_wifi_get_channel(&cur_chan, &sec);
-            ESP_LOGI(TAG, "tx ok=%lu fail=%lu cnt=%lu chan=%u",
-                     (unsigned long)sent_ok, (unsigned long)sent_fail,
-                     (unsigned long)cnt, (unsigned)cur_chan);
-            sent_ok = 0;
-            sent_fail = 0;
-            last_log_t = now_ms;
-        }
-
-        // pdMS_TO_TICKS(2) is 0 on a 100Hz tick rate, causing a watchdog crash!
-        // We use vTaskDelay(1) to guarantee we wait exactly 1 OS tick (~10ms / 100Hz).
-        vTaskDelay(1);
-    }
+    // Pin the TX loop to CPU1. Leaves CPU0 free for IDLE0 + Wi-Fi/lwip work,
+    // which avoids the task-watchdog trip that fires when our send loop
+    // monopolises CPU0 (whether through busy-wait inside esp_now_send's
+    // buffer allocator, or because pdMS_TO_TICKS rounded to 0 ticks).
+    xTaskCreatePinnedToCore(tx_task, "tx_loop", 4096, NULL, 5, NULL, 1);
 }

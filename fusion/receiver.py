@@ -1,17 +1,26 @@
 """UDP receiver for the WiFi-CSI passive sensing system.
 
-Each of the 3 Rx ESP32s sends, for every WiFi packet it captures from the
-designated Tx, one JSON line over UDP. The packet schema is:
+Each of the 3 Rx ESP32s sends one JSON line over UDP per CSI frame.
 
-    { "rx":   1,                        // Rx node id 1/2/3
-      "t":    1234567,                  // ESP32-side micros() (informational)
-      "rssi": -42.0,
-      "amp":  [a0, a1, ..., aN-1],      // per-subcarrier amplitude
-      "score":0.42                      // OPTIONAL: pre-computed motion score
+Current schema (esp-radar based firmware, preferred):
+
+    { "rx":       1,            // Rx node id 1/2/3
+      "t":        1234567,      // ESP32-side ms timestamp
+      "motion":   0.0123,       // esp-radar waveform_jitter  (fast-varying)
+      "presence": 0.0008        // esp-radar waveform_wander  (slow-varying)
     }
 
-If "score" is missing we compute it on the laptop from the rolling baseline
-of "amp". Either way the consumer downstream gets a CSIFrame with a score.
+The `motion` field is the bistatic-Fresnel score curve consumed downstream.
+
+Legacy schema (pre-esp-radar firmware, still parsed for back-compat):
+
+    { "rx": 1, "t": ..., "rssi": -42.0,
+      "amp":   [a0, a1, ...],   // per-subcarrier amplitude
+      "score": 0.42             // optional, computed on-device
+    }
+
+If neither "motion" nor "score" is present, we fall back to computing a
+score on the laptop from "amp" via the rolling baseline tracker.
 """
 
 from __future__ import annotations
@@ -119,11 +128,18 @@ def parse_line(line: str, t_arrival_us: int, baseline: _BaselineTracker) -> Opti
         amp  = [float(x) for x in obj.get("amp", [])]
         real = [int(x) for x in obj.get("real", [])]
         imag = [int(x) for x in obj.get("imag", [])]
-        score = obj.get("score")
-        if score is None:
-            score = baseline.score(rx, amp) if amp else 0.0
+
+        # Score priority:
+        #   1. "motion"  — esp-radar waveform_jitter (current firmware)
+        #   2. "score"   — legacy on-device EWMA score
+        #   3. computed locally from "amp"
+        if "motion" in obj:
+            score = float(obj["motion"])
+        elif "score" in obj:
+            score = float(obj["score"])
         else:
-            score = float(score)
+            score = baseline.score(rx, amp) if amp else 0.0
+
         return CSIFrame(
             rx_id = rx,
             t_us  = t_arrival_us,

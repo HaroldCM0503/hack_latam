@@ -1,0 +1,10 @@
+## IDF Component Manager Manifest File
+##
+## Single managed dependency: esp_csi_gain_ctrl. It's used by upstream
+## csi_recv_router for AGC/FFT-gain compensation on newer chips
+## (ESP32-S3/C3/C5/C6/C61). On plain ESP32 the compile-time guard in main.c
+## disables that path and the component is unused at runtime but still pulled
+## in by IDF — harmless.
+dependencies:
+  idf: ">=5.0"
+  esp_csi_gain_ctrl: ">=0.1.4"

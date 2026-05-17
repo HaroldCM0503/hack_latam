@@ -1,0 +1,22 @@
+{
+  "started_iso": "2026-05-17T05:50:26",
+  "started_mono": 42723.9447716,
+  "camera_w": 640,
+  "camera_h": 480,
+  "camera_fps": 30.0,
+  "clock": "time.monotonic() seconds",
+  "coord_system": "pixels, origin top-left, +x right, +y down",
+  "detection": "color",
+  "color_preset": "yellow",
+  "hsv_lo": [
+    15,
+    80,
+    80
+  ],
+  "hsv_hi": [
+    35,
+    255,
+    255
+  ],
+  "min_area": 400
+}

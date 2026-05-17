@@ -1,43 +1,58 @@
-// WiFi-CSI Rx node (ESP-IDF).
+// WiFi-CSI Rx node (ESP-IDF) — raw CSI dump via UDP.
 //
-// Joins the laptop's WiFi AP and runs in promiscuous mode in parallel. For
-// each received packet from the designated Tx MAC, extracts CSI, computes a
-// motion score against a rolling per-Rx baseline, and sends one JSON line
-// over UDP to the laptop.
+// This is espressif/esp-csi's get-started/csi_recv_router example, ported into
+// our tree with two modifications only:
 //
-// Each of the three boards is the same firmware with a different RX_ID
-// (1, 2, or 3). Set it either with a build flag (-DRX_ID=2) or by editing
-// the #define below.
+//   1. SSID/password are hardcoded here instead of pulled from the
+//      protocol_examples_common menuconfig (so the project is self-contained).
+//   2. Each captured CSI frame is shipped as a JSON line over UDP to the
+//      laptop on port 5005 — replacing csi_recv_router's CSV-over-UART dump.
 //
-// Build/flash (per board, with ESP-IDF environment configured):
-//   idf.py set-target esp32
-//   idf.py build flash monitor
+// The CSI capture path is otherwise IDENTICAL to upstream:
+//   - Associate to the AP via standard STA mode.
+//   - Filter the CSI callback on the AP's BSSID (so only frames from the AP
+//     produce callbacks — same as upstream).
+//   - Ping the gateway at 100 Hz to give the AP a steady reason to send
+//     reply traffic (gives the CSI callback a steady cadence).
+//   - esp_wifi_set_csi_config + esp_wifi_set_csi_rx_cb + esp_wifi_set_csi(true).
 //
-// Edit WIFI_SSID / WIFI_PASSWORD / LAPTOP_IP / TX_MAC below before flashing.
+// JSON schema emitted per frame:
+//   {"rx":N, "t":<esp_log_timestamp_ms>, "rssi":<dBm>, "ch":<channel>,
+//    "len":<csi_buf_bytes>, "amp":[a0, a1, ..., a_{n_subc-1}]}
+//
+// Python side (fusion/receiver.py) computes the motion score from `amp`.
 
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_event.h"
-#include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
+
 #include "nvs_flash.h"
+#include "esp_mac.h"
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+
+#include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "ping/ping_sock.h"
+
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
+#define CONFIG_GAIN_CONTROL 1
+#include "esp_csi_gain_ctrl.h"
+#endif
 
 // ---------- EDIT FOR YOUR SETUP ----------
-#define WIFI_SSID       "LAPTOP-E9GMR8ST"
-#define WIFI_PASSWORD   "1234567891"
-#define LAPTOP_IP       "192.168.137.1"     // Windows hotspot default
-#define LAPTOP_PORT     5005
+#define WIFI_SSID         "debri_net"
+#define WIFI_PASSWORD     "12345678901"
+#define LAPTOP_IP         "192.168.137.1"
+#define LAPTOP_PORT       5005
+#define PING_FREQUENCY_HZ 100
 
-// Tx MAC: read it from the Tx node's serial on first boot, paste here.
-static const uint8_t TX_MAC[6] = { 0xCC, 0x8D, 0xA2, 0xED, 0xB6, 0xF0 };
-
-// 1, 2, or 3 - MUST DIFFER between the three Rx boards.
 #ifndef RX_ID
 #define RX_ID 1
 #endif
@@ -45,45 +60,39 @@ static const uint8_t TX_MAC[6] = { 0xCC, 0x8D, 0xA2, 0xED, 0xB6, 0xF0 };
 
 static const char *TAG = "RX";
 
-#define MAX_SUBC       64
-#define BASELINE_LEN   30
-
+#define MAX_SUBC          128
 static int  udp_sock = -1;
 static struct sockaddr_in laptop_addr;
 
-// Rolling per-subcarrier amplitude baseline (EWMA).
-static float baseline_amp[MAX_SUBC] = { 0 };
-static int   baseline_count         = 0;
+// Diagnostics counters (logged every 2 s, then reset).
+static volatile uint32_t csi_cb_total  = 0;
+static volatile uint32_t csi_cb_match  = 0;
+static volatile uint32_t udp_ok        = 0;
+static volatile uint32_t udp_fail      = 0;
+static volatile bool     wifi_up       = false;
+static          uint8_t  ap_bssid[6]   = { 0 };
 
-// ---- Diagnostics counters (logged every 2 s) ----
-// csi_total          : every CSI callback (any source MAC, any state)
-// csi_first_invalid  : frames the radio flagged as decode-failures
-// csi_mac_match      : passed our TX_MAC filter
-// udp_ok / udp_fail  : UDP transmission outcome
-// last_channel       : channel of the most recent matched CSI frame
-// other_mac_count    : non-Tx MACs seen (helps spot AP/STA frames vs the
-//                      Tx node, and detect MAC typos)
-static volatile uint32_t csi_total         = 0;
-static volatile uint32_t csi_first_invalid = 0;
-static volatile uint32_t csi_mac_match     = 0;
-static volatile uint32_t udp_ok            = 0;
-static volatile uint32_t udp_fail          = 0;
-static volatile uint8_t  last_channel      = 0;
-static volatile uint8_t  last_other_mac[6] = { 0 };
-static volatile uint32_t other_mac_count   = 0;
+// ---------- Wi-Fi STA bring-up ----------
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
 
-// ---------- WiFi STA bring-up ----------
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_up = false;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ESP_LOGI(TAG, "Got IP");
+        wifi_up = true;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGI(TAG, "Got IP from %s", WIFI_SSID);
     }
 }
 
 static void wifi_init_sta(void) {
+    s_wifi_event_group = xEventGroupCreate();
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -105,10 +114,12 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    // Push UDP back to the laptop at max legal power; helps when the
-    // promiscuous radio is busy demodulating Tx packets simultaneously.
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(80));
+
+    // Block until we actually have an IP. The CSI callback registration
+    // needs the AP BSSID, which only exists after association.
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
 }
 
 // ---------- UDP socket ----------
@@ -124,175 +135,197 @@ static void udp_init(void) {
     inet_aton(LAPTOP_IP, &laptop_addr.sin_addr);
 }
 
-// ---------- CSI callback ----------
-// The Tx broadcasts ESP-NOW (action management frames) - source MAC = TX_MAC.
-// For each received packet from that MAC we compute amplitude per subcarrier,
-// derive a motion-score against a rolling baseline, and ship it.
-static void csi_cb(void *ctx, wifi_csi_info_t *info) {
-    csi_total++;
+// ---------- CSI callback (same shape as upstream csi_recv_router) ----------
+// `ctx` is the AP BSSID we registered with esp_wifi_set_csi_rx_cb (so we
+// reject frames from any other MAC). CSI buffer layout: pairs of int8
+// (imag, real) per subcarrier — same on every ESP32 family we support.
+static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info) {
+    csi_cb_total++;
 
-    // Track non-Tx-MAC sources so we can sanity-check the filter at runtime.
-    if (memcmp(info->mac, TX_MAC, 6) != 0) {
-        other_mac_count++;
-        memcpy((void *)last_other_mac, info->mac, 6);
+    if (!info || !info->buf) {
         return;
     }
-    if (info->len < 4 || info->len > MAX_SUBC * 2) return;
-
-    // Drop frames the radio flagged as decode-failures - the first CSI word
-    // is the leading subcarrier; if invalid the whole vector is garbage and
-    // would pollute the rolling baseline. This is the esp-csi reference's
-    // first-line-of-defence sanity check.
-    if (info->first_word_invalid) {
-        csi_first_invalid++;
+    if (memcmp(info->mac, ctx, 6) != 0) {
         return;
     }
-    csi_mac_match++;
-    last_channel = info->rx_ctrl.channel;
+    csi_cb_match++;
 
+    const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
+
+    // Optional gain compensation for newer chips (lifted from upstream).
+    float compensate_gain = 1.0f;
+#if CONFIG_GAIN_CONTROL
+    static int s_count = 0;
+    static uint8_t agc_gain_baseline = 0;
+    static int8_t  fft_gain_baseline = 0;
+    uint8_t agc_gain = 0;
+    int8_t  fft_gain = 0;
+    esp_csi_gain_ctrl_get_rx_gain(rx_ctrl, &agc_gain, &fft_gain);
+    if (s_count < 100) {
+        esp_csi_gain_ctrl_record_rx_gain(agc_gain, fft_gain);
+    } else if (s_count == 100) {
+        esp_csi_gain_ctrl_get_rx_gain_baseline(&agc_gain_baseline, &fft_gain_baseline);
+    }
+    esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, agc_gain, fft_gain);
+    s_count++;
+#endif
+
+    // Compute per-subcarrier amplitude from int8 (imag, real) pairs.
     int n_subc = info->len / 2;
+    if (n_subc > MAX_SUBC) n_subc = MAX_SUBC;
     float amp[MAX_SUBC];
-    int8_t raw_real[MAX_SUBC];
-    int8_t raw_imag[MAX_SUBC];
     for (int i = 0; i < n_subc; i++) {
-        int8_t imag = info->buf[i * 2];
-        int8_t real = info->buf[i * 2 + 1];
-        raw_real[i] = real;
-        raw_imag[i] = imag;
-        amp[i] = sqrtf((float)real * real + (float)imag * imag);
+        int8_t imag = (int8_t)info->buf[i * 2];
+        int8_t real = (int8_t)info->buf[i * 2 + 1];
+        float r = compensate_gain * (float)real;
+        float m = compensate_gain * (float)imag;
+        amp[i] = sqrtf(r * r + m * m);
     }
 
-    // ---- Motion score against rolling baseline ----
-    float score = 0.0f;
-    if (baseline_count >= BASELINE_LEN) {
-        float diff_sq = 0.0f, base_sq = 0.0f;
-        for (int i = 0; i < n_subc; i++) {
-            float d = amp[i] - baseline_amp[i];
-            diff_sq += d * d;
-            base_sq += baseline_amp[i] * baseline_amp[i];
-        }
-        if (base_sq > 1.0f) {
-            score = sqrtf(diff_sq / base_sq);
-        }
-    }
-    // EWMA baseline update
-    float alpha = (baseline_count < BASELINE_LEN)
-                    ? 1.0f / (float)(baseline_count + 1)
-                    : 1.0f / (float)BASELINE_LEN;
-    for (int i = 0; i < n_subc; i++) {
-        baseline_amp[i] += alpha * (amp[i] - baseline_amp[i]);
-    }
-    if (baseline_count < BASELINE_LEN) baseline_count++;
+    if (udp_sock < 0) return;
 
-    // ---- Build JSON ----
-    // Compact - only include `amp` array if you need the per-subcarrier waterfall
-    // visualisation downstream. Comment out the amp section to save bandwidth.
-    char buf[2048];
+    // Build the JSON. Sized for 128 subcarriers worst case (each amp <= ~7 chars).
+    char buf[1600];
     int  n = snprintf(buf, sizeof(buf),
-                      "{\"rx\":%d,\"t\":%lu,\"rssi\":%d,\"score\":%.4f,\"amp\":[",
+                      "{\"rx\":%d,\"t\":%lu,\"rssi\":%d,\"ch\":%u,\"len\":%d,\"amp\":[",
                       (int)RX_ID,
-                      (unsigned long)info->rx_ctrl.timestamp,
-                      (int)info->rx_ctrl.rssi,
-                      score);
-    for (int i = 0; i < n_subc && n < (int)sizeof(buf) - 128; i++) {
-        n += snprintf(buf + n, sizeof(buf) - n, "%s%.1f", (i ? "," : ""), amp[i]);
-    }
-    n += snprintf(buf + n, sizeof(buf) - n, "],\"real\":[");
-    for (int i = 0; i < n_subc && n < (int)sizeof(buf) - 128; i++) {
-        n += snprintf(buf + n, sizeof(buf) - n, "%s%d", (i ? "," : ""), (int)raw_real[i]);
-    }
-    n += snprintf(buf + n, sizeof(buf) - n, "],\"imag\":[");
-    for (int i = 0; i < n_subc && n < (int)sizeof(buf) - 128; i++) {
-        n += snprintf(buf + n, sizeof(buf) - n, "%s%d", (i ? "," : ""), (int)raw_imag[i]);
+                      (unsigned long)esp_log_timestamp(),
+                      (int)rx_ctrl->rssi,
+                      (unsigned)rx_ctrl->channel,
+                      (int)info->len);
+    for (int i = 0; i < n_subc && n < (int)sizeof(buf) - 32; i++) {
+        n += snprintf(buf + n, sizeof(buf) - n, "%s%.1f", i ? "," : "", amp[i]);
     }
     n += snprintf(buf + n, sizeof(buf) - n, "]}");
+    if (n <= 0 || n >= (int)sizeof(buf)) return;
 
-    if (udp_sock >= 0) {
-        int r = sendto(udp_sock, buf, n, 0,
-                       (struct sockaddr *)&laptop_addr, sizeof(laptop_addr));
-        if (r > 0) udp_ok++; else udp_fail++;
-    }
+    int r = sendto(udp_sock, buf, n, 0,
+                   (struct sockaddr *)&laptop_addr, sizeof(laptop_addr));
+    if (r > 0) udp_ok++; else udp_fail++;
+}
+
+// ---------- CSI bring-up (upstream wifi_csi_init, verbatim) ----------
+static void wifi_csi_init(void) {
+#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
+    wifi_csi_config_t csi_config = {
+        .enable                   = true,
+        .acquire_csi_legacy       = true,
+        .acquire_csi_force_lltf   = 0,
+        .acquire_csi_ht20         = true,
+        .acquire_csi_ht40         = true,
+        .acquire_csi_vht          = false,
+        .acquire_csi_su           = false,
+        .acquire_csi_mu           = false,
+        .acquire_csi_dcm          = false,
+        .acquire_csi_beamformed   = false,
+        .acquire_csi_he_stbc_mode = 2,
+        .val_scale_cfg            = 0,
+        .dump_ack_en              = false,
+        .reserved                 = false,
+    };
+#elif CONFIG_IDF_TARGET_ESP32C6
+    wifi_csi_config_t csi_config = {
+        .enable                 = true,
+        .acquire_csi_legacy     = true,
+        .acquire_csi_ht20       = true,
+        .acquire_csi_ht40       = true,
+        .acquire_csi_su         = false,
+        .acquire_csi_mu         = false,
+        .acquire_csi_dcm        = false,
+        .acquire_csi_beamformed = false,
+        .acquire_csi_he_stbc    = 2,
+        .val_scale_cfg          = false,
+        .dump_ack_en            = false,
+        .reserved               = false,
+    };
+#else
+    wifi_csi_config_t csi_config = {
+        .lltf_en           = true,
+        .htltf_en          = false,
+        .stbc_htltf2_en    = false,
+        .ltf_merge_en      = true,
+        .channel_filter_en = true,
+        .manu_scale        = true,
+        .shift             = true,
+    };
+#endif
+
+    static wifi_ap_record_t s_ap_info = { 0 };
+    ESP_ERROR_CHECK(esp_wifi_sta_get_ap_info(&s_ap_info));
+    memcpy(ap_bssid, s_ap_info.bssid, 6);
+
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
+    // Pass AP BSSID as ctx so the callback filters on it.
+    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_rx_cb, s_ap_info.bssid));
+    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+
+    ESP_LOGI(TAG,
+        "CSI capture started, filter=AP BSSID %02X:%02X:%02X:%02X:%02X:%02X, "
+        "streaming JSON to %s:%d",
+        ap_bssid[0], ap_bssid[1], ap_bssid[2],
+        ap_bssid[3], ap_bssid[4], ap_bssid[5],
+        LAPTOP_IP, LAPTOP_PORT);
+}
+
+// ---------- Gateway ping (drives the CSI rate) ----------
+static void ping_router_start(uint32_t freq_hz) {
+    static esp_ping_handle_t ping_handle = NULL;
+
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.count            = 0;
+    cfg.interval_ms      = 1000 / freq_hz;
+    cfg.task_stack_size  = 3072;
+    cfg.data_size        = 1;
+
+    esp_netif_ip_info_t local_ip;
+    esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"),
+                          &local_ip);
+    cfg.target_addr.u_addr.ip4.addr = ip4_addr_get_u32(&local_ip.gw);
+    cfg.target_addr.type            = ESP_IPADDR_TYPE_V4;
+
+    esp_ping_callbacks_t cbs = { 0 };
+    esp_ping_new_session(&cfg, &cbs, &ping_handle);
+    esp_ping_start(ping_handle);
+
+    ESP_LOGI(TAG, "ping: target=" IPSTR " interval=%lu ms (~%lu Hz)",
+             IP2STR((esp_ip4_addr_t *)&local_ip.gw),
+             (unsigned long)cfg.interval_ms, (unsigned long)freq_hz);
 }
 
 // ---------- Diagnostics task ----------
-// Logs counters every 2 s and resets them, so you can see live rates.
 static void stats_task(void *arg) {
-    uint8_t tx_chan = 0;
-    wifi_second_chan_t sec;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(2000));
-        esp_wifi_get_channel(&tx_chan, &sec);
         ESP_LOGI(TAG,
-            "csi_total=%lu match=%lu first_invalid=%lu other_mac=%lu "
-            "udp_ok=%lu udp_fail=%lu  | our_chan=%u rx_chan=%u",
-            (unsigned long)csi_total,
-            (unsigned long)csi_mac_match,
-            (unsigned long)csi_first_invalid,
-            (unsigned long)other_mac_count,
+            "rx_id=%d  csi total=%lu match=%lu (~%lu Hz)  "
+            "udp ok=%lu fail=%lu  wifi=%s",
+            (int)RX_ID,
+            (unsigned long)csi_cb_total,
+            (unsigned long)csi_cb_match,
+            (unsigned long)(csi_cb_match / 2),
             (unsigned long)udp_ok,
             (unsigned long)udp_fail,
-            (unsigned)tx_chan,
-            (unsigned)last_channel);
-        if (other_mac_count && csi_mac_match == 0) {
-            ESP_LOGW(TAG,
-                "Seeing CSI but never matching TX_MAC. Last other MAC: "
-                "%02X:%02X:%02X:%02X:%02X:%02X  -- typo in TX_MAC?",
-                last_other_mac[0], last_other_mac[1], last_other_mac[2],
-                last_other_mac[3], last_other_mac[4], last_other_mac[5]);
-        }
-        csi_total = 0;
-        csi_mac_match = 0;
-        csi_first_invalid = 0;
-        other_mac_count = 0;
+            wifi_up ? "UP" : "DOWN");
+        csi_cb_total = 0;
+        csi_cb_match = 0;
         udp_ok = 0;
         udp_fail = 0;
     }
 }
 
-// ---------- Promiscuous + CSI enable ----------
-static void start_csi_capture(void) {
-    wifi_promiscuous_filter_t filt = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-
-    // Capture both the legacy LTF and HT-LTF training fields and let the
-    // radio average them ("LTF merge"). This is the configuration used by
-    // espressif/esp-csi's `csi_recv` example - it produces the cleanest CSI
-    // vectors out of the box. channel_filter_en applies the radio's matched
-    // filter and reduces broadband noise floor.
-    wifi_csi_config_t csi_cfg = {
-        .lltf_en           = true,
-        .htltf_en          = true,
-        .stbc_htltf2_en    = true,
-        .ltf_merge_en      = true,
-        .channel_filter_en = true,
-        .manu_scale        = false,
-        .shift             = 0,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(csi_cb, NULL));
-    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
-}
-
 void app_main(void) {
+    ESP_LOGI(TAG, "=== Rx node #%d starting ===", (int)RX_ID);
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    ESP_LOGI(TAG, "=== Rx node #%d starting ===", (int)RX_ID);
-
-    wifi_init_sta();
-    // Wait for IP
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
+    wifi_init_sta();           // blocks until we have an IP
     udp_init();
-    start_csi_capture();
-
-    ESP_LOGI(TAG, "Capturing CSI, streaming to %s:%d", LAPTOP_IP, LAPTOP_PORT);
+    wifi_csi_init();
+    ping_router_start(PING_FREQUENCY_HZ);
 
     xTaskCreatePinnedToCore(stats_task, "stats", 4096, NULL, 5, NULL, 0);
 

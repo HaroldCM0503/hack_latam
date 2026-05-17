@@ -1,15 +1,19 @@
 # Settings adopted from espressif/esp-csi's csi_send example.
 
-CONFIG_ESP32_WIFI_CSI_ENABLED=y
+CONFIG_ESP_WIFI_CSI_ENABLED=y
 
-# Tight TX buffer queue keeps the packet rate steady at the ~100 Hz cadence
-# without backlog spikes.
+# 1 kHz tick rate so usleep() granularity is ~1 ms (vs 10 ms at the default
+# 100 Hz tick). Lets us actually hit the 500 Hz SEND_FREQUENCY target instead
+# of being clamped to ~100 Hz by FreeRTOS tick rounding.
+CONFIG_FREERTOS_HZ=1000
+
+# Larger TX buffer pool so the 500 Hz burst doesn't backlog on the radio.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
-CONFIG_ESP_WIFI_TX_BUFFER=64
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=128
 
-# Disable AMPDU on the Tx side too - each ESP-NOW broadcast should fly as
-# its own frame so each Rx sees one CSI callback per Tx call.
+# Disable AMPDU on the Tx side - each ESP-NOW broadcast should fly as its
+# own frame so each Rx sees one CSI callback per Tx call.
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 

@@ -1,0 +1,11 @@
+{
+  "started_iso": "2026-05-17T05:30:38",
+  "started_mono": 41536.0725261,
+  "camera_w": 640,
+  "camera_h": 480,
+  "camera_fps_request": 30.0,
+  "yolo_model": "yolo11n.pt",
+  "target_class": 32,
+  "coord_system": "pixels, origin top-left, +x right, +y down",
+  "clock": "time.monotonic() seconds"
+}
