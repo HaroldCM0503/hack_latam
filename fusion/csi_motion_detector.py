@@ -35,6 +35,7 @@ import socket
 import threading
 import time
 from collections import deque
+from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 import cv2
@@ -52,6 +53,12 @@ MAX_SUBC          = 64       # 802.11n 20 MHz CSI buffer width
 AMP_VMAX          = 80.0     # initial Y-axis ceiling
 CHART_HEIGHT_PER_RX = 160    # pixel height of each Rx subplot
 
+# ---- Car / signal-drop detection defaults ----------------------------------
+DROP_THRESHOLD    = -5.0     # mean relative deviation (%) below which = drop
+COHERENCE_MIN     = 0.60     # fraction of subcarriers that must drop together
+DROP_CONSECUTIVE  = 1        # consecutive drop-hits needed to confirm
+DROP_HOLD_SEC     = 1.5      # seconds the drop flag stays True after last hit
+
 
 # ===========================================================================
 # Per-Rx motion analyser
@@ -61,8 +68,13 @@ class RxMotionAnalyser:
     computes the rolling-average + per-sample RMS deviation described in
     the module docstring."""
 
-    def __init__(self, window_sec: float, rms_threshold: float,
-                 consecutive_hits: int, ts_len: int = TIMESERIES_LEN):
+    def __init__(self, rx_id: int, window_sec: float, rms_threshold: float,
+                 consecutive_hits: int, ts_len: int = TIMESERIES_LEN,
+                 drop_threshold: float = DROP_THRESHOLD,
+                 coherence_min: float = COHERENCE_MIN,
+                 drop_consecutive: int = DROP_CONSECUTIVE,
+                 drop_hold_sec: float = DROP_HOLD_SEC):
+        self.rx_id           = rx_id
         self.window_sec      = window_sec
         self.rms_threshold   = rms_threshold
         self.consecutive_hits = consecutive_hits
@@ -90,6 +102,27 @@ class RxMotionAnalyser:
         self.amp_history = np.zeros((ts_len, MAX_SUBC), dtype=np.float32)
         self.pkt_count   = 0
 
+        # Static baseline parameters (same as webcam_yolo)
+        self.static_base: Optional[np.ndarray] = None
+        self.capturing_base: bool = False
+        self.capture_buffer: list = []
+        self.capture_end_time: float = 0.0
+
+        # ---- Car / signal-drop detection state -----------------------------
+        self._drop_threshold   = drop_threshold    # signed % below baseline
+        self._coherence_min    = coherence_min      # fraction of subcarriers
+        self._drop_consecutive = drop_consecutive
+        self._drop_hold_sec    = drop_hold_sec
+        self._drop_hit_count   = 0
+        self._drop_last_hit_t  = 0.0
+        self.last_mean_rel: float  = 0.0   # signed mean relative deviation %
+        self.last_coherence: float = 0.0   # fraction of subcarriers that dropped
+        self.drop_detected: bool   = False # True while a confirmed car drop is active
+        self._drop_printed: bool   = False # prevents repeated console spam
+
+    def _time_str(self) -> str:
+        return time.strftime("%H:%M:%S") + f".{int((time.time() % 1) * 1000):03d}"
+
     # ---- helpers -----------------------------------------------------------
     def _evict_old(self, now: float) -> None:
         """Drop samples older than ``window_sec`` and update running sum."""
@@ -99,11 +132,30 @@ class RxMotionAnalyser:
             self._running_sum -= old_amp
             self._running_count -= 1
 
+    def start_capture(self, duration_sec: float) -> None:
+        self.capture_buffer = []
+        self.capturing_base = True
+        self.capture_end_time = time.monotonic() + duration_sec
+
+    def clear_baseline(self) -> None:
+        self.static_base = None
+
     # ---- main entry --------------------------------------------------------
     def push(self, t_mono: float, amp_list) -> None:
         """Feed one CSI amplitude measurement. Prints 'ok!' when sustained
         motion is detected."""
         amp = np.asarray(amp_list, dtype=np.float64)
+
+        if self.capturing_base:
+            if t_mono < self.capture_end_time:
+                self.capture_buffer.append(amp)
+                return
+            else:
+                self.capturing_base = False
+                if self.capture_buffer:
+                    self.static_base = np.mean(self.capture_buffer, axis=0)
+                    print(f"[{self._time_str()}] [SYS/CALIB] [RX-{self.rx_id}] Static baseline locked from {len(self.capture_buffer)} packets.")
+                self.capture_buffer = []
 
         # Push raw amplitudes into the per-subcarrier history
         n_sub = min(len(amp), MAX_SUBC)
@@ -130,32 +182,71 @@ class RxMotionAnalyser:
         self._running_count += 1
         self._ring.append((t_mono, amp.copy()))
 
-        # Compute moving average
-        if self._running_count < 2:
-            self.last_rms = 0.0
-            return
-        avg = self._running_sum[:len(amp)] / self._running_count
+        # Compute baseline average (static baseline if captured, otherwise rolling average)
+        if self.static_base is not None:
+            avg = self.static_base[:len(amp)]
+        else:
+            if self._running_count < 2:
+                self.last_rms = 0.0
+                return
+            avg = self._running_sum[:len(amp)] / self._running_count
+            
         self.last_avg = avg
 
-        # Absolute mean error — uniform shifts accumulate while random noise
+        # Relative deviation per-subcarrier
+        # Capped denominator prevents null subcarriers from blowing up with noise
+        noise_floor = max(1e-6, float(np.max(avg)) * 0.05)
+        safe_avg = np.maximum(avg, noise_floor)
+        
+        # Signed relative difference — uniform shifts accumulate while random noise
         # cancels out in the signed mean, giving coherent drops more weight.
-        diff = amp - avg
-        rms  = float(np.abs(np.mean(diff)))
+        rel_diff = (amp - avg) / safe_avg
+        
+        # Multiply by 100 to convert to a percentage so the trackbar (0-20) 
+        # still feels intuitive and the default 3.0 threshold corresponds to 3%.
+        rms = float(np.abs(np.mean(rel_diff))) * 100.0
         self.last_rms = rms
 
         # Push into the timeseries ring
         self.rms_history[:-1] = self.rms_history[1:]
         self.rms_history[-1]  = rms
 
-        # Threshold check
+        # Threshold check (general motion)
         if rms > self.rms_threshold:
             self._hit_count += 1
             if self._hit_count >= self.consecutive_hits and not self._fired:
-                print("ok!")
                 self._fired = True
         else:
             self._hit_count = 0
             self._fired = False
+
+        # ---- Car / signal-drop detection ----------------------------------
+        # Signed mean relative deviation (negative = amplitude dropped)
+        mean_rel = float(np.mean(rel_diff)) * 100.0
+        # Fraction of subcarriers whose individual amplitude dropped > 5 %
+        coherence = float(np.mean(rel_diff < -0.05))
+        self.last_mean_rel  = mean_rel
+        self.last_coherence = coherence
+
+        is_drop_hit = (mean_rel < self._drop_threshold) and (coherence >= self._coherence_min)
+
+        if is_drop_hit:
+            self._drop_hit_count += 1
+            self._drop_last_hit_t = t_mono
+            if self._drop_hit_count >= self._drop_consecutive and not self.drop_detected:
+                self.drop_detected = True
+                if not self._drop_printed:
+                    self._drop_printed = True
+                    print(f"[{self._time_str()}] [CAR-DROP]  [RX-{self.rx_id}] "
+                          f"DROP detected  mean={mean_rel:+.1f}%  coh={coherence:.2f}")
+        else:
+            self._drop_hit_count = 0
+            # Hold the flag for _drop_hold_sec after the last hit
+            if self.drop_detected and (t_mono - self._drop_last_hit_t) > self._drop_hold_sec:
+                self.drop_detected = False
+                self._drop_printed = False
+                print(f"[{self._time_str()}] [CAR-RECV] [RX-{self.rx_id}] "
+                      f"Signal recovered")
 
 
 # ===========================================================================
@@ -166,9 +257,17 @@ class CSIMotionListener:
     ``RxMotionAnalyser`` instances."""
 
     def __init__(self, rx_ids: list[int], window_sec: float,
-                 rms_threshold: float, consecutive_hits: int):
+                 rms_threshold: float, consecutive_hits: int,
+                 drop_threshold: float = DROP_THRESHOLD,
+                 coherence_min: float = COHERENCE_MIN,
+                 drop_consecutive: int = DROP_CONSECUTIVE,
+                 drop_hold_sec: float = DROP_HOLD_SEC):
         self.analysers: Dict[int, RxMotionAnalyser] = {
-            rx: RxMotionAnalyser(window_sec, rms_threshold, consecutive_hits)
+            rx: RxMotionAnalyser(rx, window_sec, rms_threshold, consecutive_hits,
+                                 drop_threshold=drop_threshold,
+                                 coherence_min=coherence_min,
+                                 drop_consecutive=drop_consecutive,
+                                 drop_hold_sec=drop_hold_sec)
             for rx in rx_ids
         }
         self.stop_flag = threading.Event()
@@ -254,8 +353,12 @@ class CSIMotionListener:
 def open_camera(cam_index: int, width: int, height: int):
     backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
     cap = cv2.VideoCapture(cam_index, backend)
+    # Set MJPG compression to allow high framerates at high resolutions
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     if width:  cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
     if height: cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    # Force fallback to maximum hardware framerate
+    cap.set(cv2.CAP_PROP_FPS, 1000)
     if not cap.isOpened():
         raise RuntimeError(f"could not open camera {cam_index}")
     aw  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -361,30 +464,29 @@ def draw_overlay(frame, rx_positions_px: dict,
     tx_pos = (w // 2, h - 1)
 
     # ---- link lines TX → each Rx (drawn first = underneath) ---------------
+    teal = (235, 180, 52)   # consistent teal for all laser lines (BGR)
     if rx_positions_px:
         for rx, (rx_x, rx_y) in rx_positions_px.items():
-            color = _rx_color(rx)
             a = analysers.get(rx)
             rms = a.last_rms if a else 0.0
             intensity = max(0.25, min(2.0, 0.25 + rms * 0.6))
-            _glow_line(frame, tx_pos, (rx_x, rx_y), color, intensity)
+            _glow_line(frame, tx_pos, (rx_x, rx_y), teal, intensity)
 
         # TX node
         _glow_circle(frame, tx_pos, 5, (220, 220, 220), 0.5)
 
         # RX nodes
         for rx, (rx_x, rx_y) in rx_positions_px.items():
-            color = _rx_color(rx)
             a = analysers.get(rx)
             rms = a.last_rms if a else 0.0
             intensity = max(0.5, min(2.0, 0.5 + rms * 0.8))
-            _glow_circle(frame, (rx_x, rx_y), 8, color, intensity)
+            _glow_circle(frame, (rx_x, rx_y), 8, teal, intensity)
             lbl = f"RX{rx}"
             if rms > 0.01:
                 lbl += f"  {rms:.2f}"
             cv2.putText(frame, lbl, (rx_x + 14, rx_y + 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                        tuple(min(255, c + 40) for c in color), 1,
+                        tuple(min(255, c + 40) for c in teal), 1,
                         cv2.LINE_AA)
 
     # ---- glassmorphic top status panel ------------------------------------
@@ -393,31 +495,6 @@ def draw_overlay(frame, rx_positions_px: dict,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (230, 230, 240), 1, cv2.LINE_AA)
     cv2.putText(frame, info_bot, (14, 48),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, (160, 165, 175), 1, cv2.LINE_AA)
-
-    # ---- per-Rx RMS indicator bars (bottom, inside glass panel) -----------
-    bar_panel_h = 18 * len(analysers) + 16
-    _glass_panel(frame, 6, h - bar_panel_h - 30, min(w - 12, 300), bar_panel_h)
-    y_off = h - 30 - bar_panel_h + 12
-    for rx in sorted(analysers.keys()):
-        a = analysers[rx]
-        color = _rx_color(rx)
-        rms = a.last_rms
-        max_bar = min(240, w - 80)
-        bar_w = min(int(rms * 30), max_bar)
-        # Bar background
-        cv2.rectangle(frame, (14, y_off), (14 + max_bar, y_off + 10),
-                      (35, 35, 40), -1)
-        # Filled portion with gradient feel
-        if bar_w > 0:
-            for bx in range(bar_w):
-                frac = bx / max(1, max_bar)
-                bc = tuple(int(c * (0.6 + 0.4 * frac)) for c in color)
-                cv2.line(frame, (14 + bx, y_off + 1),
-                         (14 + bx, y_off + 9), bc, 1)
-        cv2.putText(frame, f"RX{rx} {rms:.2f}",
-                    (14 + max_bar + 8, y_off + 9),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
-        y_off += 18
 
     # ---- bottom key hint --------------------------------------------------
     cv2.putText(frame, "Q quit", (10, h - 8),
@@ -516,8 +593,15 @@ def render_timeseries(width: int, rx_ids: list,
                     cv2.LINE_AA)
 
         # Title for this Rx subplot
-        state_lbl = "LIVE" if a.pkt_count > 0 else "----"
-        color = _rx_color(rx)
+        if getattr(a, "drop_detected", False):
+            state_lbl = "CAR-DROP"
+            color = (0, 180, 255)
+        elif a.pkt_count > 0:
+            state_lbl = "LIVE"
+            color = (0, 255, 0) if getattr(a, "_fired", False) else (0, 0, 255)
+        else:
+            state_lbl = "----"
+            color = (0, 0, 255)
         # Colored dot + text
         cv2.circle(canvas, (pad_l + 4, region_top + 11), 4, color, -1,
                    cv2.LINE_AA)
@@ -541,12 +625,12 @@ def main():
     )
     # Camera
     ap.add_argument("--cam",    type=int, default=0, help="OpenCV camera index")
-    ap.add_argument("--width",  type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--width",  type=int, default=10000)
+    ap.add_argument("--height", type=int, default=10000)
     # Rx layout
     ap.add_argument("--rx-ids", default="1,2",
                     help="comma-separated Rx ids (default 1,2)")
-    ap.add_argument("--rx-positions-px", default=None,
+    ap.add_argument("--rx-positions-px", default="300,40;400,300",
                     help="pixel position of each Rx in the camera frame, "
                          "semicolon-separated. Format: 'x,y;x,y;...'.")
     # Motion algorithm tuning
@@ -556,9 +640,25 @@ def main():
                     help=f"RMS threshold for a 'hit' (default {RMS_THRESHOLD})")
     ap.add_argument("--consecutive", type=int, default=CONSECUTIVE_HITS,
                     help=f"consecutive hits before printing 'ok!' (default {CONSECUTIVE_HITS})")
+    ap.add_argument("--baseline-capture-sec", type=float, default=3.0,
+                    help="how many seconds to average over when you press B (default 3.0 s)")
     ap.add_argument("--display-width", type=int, default=900,
                     help="width of the output display in pixels, independent "
                          "of the camera resolution (default 900)")
+    ap.add_argument("--video-delay", type=float, default=0.0,
+                    help="delay the video display in seconds to match CSI signal latency")
+    # Car / signal-drop detection
+    ap.add_argument("--drop-threshold", type=float, default=DROP_THRESHOLD,
+                    help=f"mean relative deviation (%%) below which = car drop "
+                         f"(default {DROP_THRESHOLD})")
+    ap.add_argument("--coherence-min", type=float, default=COHERENCE_MIN,
+                    help=f"fraction of subcarriers that must drop together "
+                         f"(default {COHERENCE_MIN})")
+    ap.add_argument("--drop-consecutive", type=int, default=DROP_CONSECUTIVE,
+                    help=f"consecutive drop-hits to confirm (default {DROP_CONSECUTIVE})")
+    ap.add_argument("--drop-hold", type=float, default=DROP_HOLD_SEC,
+                    help=f"seconds the drop flag stays active after last hit "
+                         f"(default {DROP_HOLD_SEC})")
     args = ap.parse_args()
 
     rx_ids = [int(s) for s in args.rx_ids.split(",") if s.strip()]
@@ -589,6 +689,10 @@ def main():
     # Start CSI listener + per-Rx motion analysers
     csi = CSIMotionListener(
         rx_ids, args.window_sec, args.rms_threshold, args.consecutive,
+        drop_threshold=args.drop_threshold,
+        coherence_min=args.coherence_min,
+        drop_consecutive=args.drop_consecutive,
+        drop_hold_sec=args.drop_hold,
     )
     csi.start()
 
@@ -598,24 +702,19 @@ def main():
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, display_w, display_h + chart_h)
 
-    # ---- trackbars for live tuning ----------------------------------------
-    def _on_threshold(v):
-        thr = max(0.1, v / 10.0)
-        for a in csi.analysers.values():
-            a.rms_threshold = thr
-    cv2.createTrackbar("RMS thr x10", win,
-                       int(args.rms_threshold * 10), 200, _on_threshold)
-
-    def _on_consecutive(v):
-        v = max(1, v)
-        for a in csi.analysers.values():
-            a.consecutive_hits = v
-    cv2.createTrackbar("consec hits", win,
-                       args.consecutive, 100, _on_consecutive)
 
     fps_dts   = deque(maxlen=30)
     t_prev    = time.monotonic()
     frame_cnt = 0
+
+    frame_buffer = deque()
+
+    # ---- video recorder (lazy init on first combined frame) ----------------
+    rec_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+    os.makedirs(rec_dir, exist_ok=True)
+    rec_ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rec_path = os.path.join(rec_dir, f"csi_{rec_ts}.mp4")
+    writer: Optional[cv2.VideoWriter] = None
 
     try:
         while True:
@@ -625,6 +724,20 @@ def main():
                 break
             t_mono = time.monotonic()
             frame_cnt += 1
+
+            # Buffer frame for delay alignment
+            frame_buffer.append((t_mono, frame))
+            max_delay = max(0.0, args.video_delay)
+            while len(frame_buffer) > 1 and (t_mono - frame_buffer[1][0]) > max_delay:
+                frame_buffer.popleft()
+            
+            # Find the delayed frame
+            target_t = t_mono - max_delay
+            display_frame = frame_buffer[0][1]
+            for t_f, frm in frame_buffer:
+                if t_f >= target_t:
+                    display_frame = frm
+                    break
 
             # FPS
             dt = t_mono - t_prev
@@ -641,23 +754,43 @@ def main():
             info_top = f"fps={fps:.1f}  f={frame_cnt}  " + "  ".join(rms_parts)
             info_bot = csi.status_string()
 
-            # Resize camera frame to display resolution before overlay
-            frame = cv2.resize(frame, (display_w, display_h),
-                               interpolation=cv2.INTER_LINEAR)
+            # Resize delayed camera frame to display resolution before overlay
+            display_frame_resized = cv2.resize(display_frame, (display_w, display_h),
+                                               interpolation=cv2.INTER_LINEAR)
 
-            draw_overlay(frame, rx_positions_px, csi.analysers,
+            draw_overlay(display_frame_resized, rx_positions_px, csi.analysers,
                          info_top, info_bot)
 
             # Render chart at display width (independent of camera)
             chart_img = render_timeseries(display_w, rx_ids, csi.analysers,
                                            rx_rates=csi.rx_rates())
-            combined = np.vstack([frame, chart_img])
+            combined = np.vstack([display_frame_resized, chart_img])
+
+            # Write frame to recording
+            if writer is None:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                writer = cv2.VideoWriter(rec_path, fourcc, 20.0,
+                                         (combined.shape[1], combined.shape[0]))
+                print(f"[REC] recording to {rec_path}")
+            writer.write(combined)
+
             cv2.imshow(win, combined)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
+            elif key == ord('b'):
+                print(f"[SYS] Capturing static baselines for {args.baseline_capture_sec:.1f}s — keep still")
+                for a in csi.analysers.values():
+                    a.start_capture(args.baseline_capture_sec)
+            elif key == ord('c'):
+                print("[SYS] Static baselines cleared (reverted to rolling average)")
+                for a in csi.analysers.values():
+                    a.clear_baseline()
     finally:
+        if writer is not None:
+            writer.release()
+            print(f"[REC] saved {rec_path}")
         csi.shutdown()
         cap.release()
         cv2.destroyAllWindows()

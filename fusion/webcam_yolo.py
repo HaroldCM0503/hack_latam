@@ -429,8 +429,12 @@ class MovingCarBackend:
 def open_camera(cam_index: int, width: int, height: int):
     backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
     cap = cv2.VideoCapture(cam_index, backend)
+    # Set MJPG compression to allow high framerates at high resolutions
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     if width:  cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
     if height: cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    # Force fallback to maximum hardware framerate
+    cap.set(cv2.CAP_PROP_FPS, 1000)
     if not cap.isOpened():
         raise RuntimeError(f"could not open camera {cam_index} — try a different --cam")
     aw   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -707,8 +711,8 @@ def main():
                          "1+=external USB. Run with --list-cams to probe.")
     ap.add_argument("--list-cams", action="store_true",
                     help="Probe camera indices 0..4, print their resolution, exit.")
-    ap.add_argument("--width",  type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--width",  type=int, default=10000)
+    ap.add_argument("--height", type=int, default=10000)
     # Recording
     ap.add_argument("--record", default=None,
                     help="run dir to start recording into (omit = idle, R toggles)")

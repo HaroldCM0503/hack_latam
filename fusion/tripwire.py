@@ -199,9 +199,17 @@ class _RxState:
 
         # 2) score against recorded baseline + EMA drift
         base = self.recorded_base[:n] + self.ema_drift[:n]
-        diff_norm = float(np.linalg.norm(amp32 - base))
-        base_norm = float(np.linalg.norm(self.recorded_base[:n]))
-        score = (diff_norm / base_norm) if base_norm > 1e-6 else 0.0
+        
+        # Per-subcarrier relative deviation so weak subcarriers aren't drowned out.
+        # We cap the minimum denominator at 5% of the max baseline amplitude 
+        # so that null/guard subcarriers don't blow up with noise.
+        noise_floor = max(1e-6, float(np.max(self.recorded_base[:n])) * 0.05)
+        safe_base = np.maximum(self.recorded_base[:n], noise_floor)
+        
+        rel_diff = np.abs(amp32 - base) / safe_base
+        
+        # Score is the RMS (Root Mean Square) of the relative deviations
+        score = float(np.linalg.norm(rel_diff) / np.sqrt(n))
 
         # 3) state machine
         event = None
