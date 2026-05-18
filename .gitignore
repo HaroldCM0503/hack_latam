@@ -27,3 +27,5 @@ __pycache__/
 venv/
 env/
 .pytest_cache/
+yolo11n.pt
+data/
