@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fresnel Zone Dynamics</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+    <!-- Meta tags for SEO best practices -->
+    <meta name="description"
+        content="A real-time JavaScript simulation of the Fresnel Zone Model, visualizing wave interference and spatial DSP in a modern interface.">
+</head>
+
+<body>
+    <div class="app-layout">
+        <header class="glass-panel">
+            <div class="title-container">
+                <h1>Fresnel Zone Simulator</h1>
+                <p>Real-time Kinematic DSP & Wave Interference</p>
+            </div>
+            <div class="status-container">
+                <span class="badge crossing-badge" id="crossingBadge">No Crossing</span>
+                <span class="badge speed-badge" id="speedEstBadge">Est. Speed: --</span>
+                <span class="badge true-speed-badge" id="trueSpeedBadge">True Speed: --</span>
+                <span class="badge" id="fpsBadge">60 FPS</span>
+                <span class="badge" id="modeBadge">Single-Carrier</span>
+            </div>
+        </header>
+
+        <main>
+            <div class="view-panel glass-panel">
+                <div class="panel-header">
+                    <h2>Spatial View (The Room)</h2>
+                </div>
+                <div class="canvas-wrapper">
+                    <canvas id="spatialCanvas"></canvas>
+                </div>
+            </div>
+
+            <div class="view-panel glass-panel">
+                <div class="panel-header">
+                    <h2>DSP Oscilloscope (The Chirp)</h2>
+                </div>
+                <div class="canvas-wrapper dsp-wrapper">
+                    <canvas id="dspCanvas"></canvas>
+                </div>
+            </div>
+        </main>
+
+        <aside class="glass-panel sidebar">
+            <h2>Simulation Physics</h2>
+
+            <div class="control-group">
+                <label for="freqSlider">
+                    <span>Uplink Frequency (Ka-Band)</span>
+                    <span class="value-display" id="freqVal">23.00 GHz</span>
+                </label>
+                <input type="range" id="freqSlider" min="22.55" max="23.55" step="0.01" value="23.00">
+            </div>
+
+            <div class="control-group">
+                <label for="velSlider">
+                    <span>Target Velocity</span>
+                    <span class="value-display" id="velVal">1000 m/s</span>
+                </label>
+                <input type="range" id="velSlider" min="1000" max="5000.0" step="100" value="1000">
+            </div>
+
+            <div class="control-group">
+                <label for="noiseSlider">
+                    <span>Signal Noise</span>
+                    <span class="value-display" id="noiseVal">5%</span>
+                </label>
+                <input type="range" id="noiseSlider" min="0" max="0.5" step="0.01" value="0.05">
+            </div>
+
+            <div class="separator"></div>
+            <h2>Kinematics</h2>
+
+            <div class="button-group">
+                <button id="spawnParticleBtn" class="highlight">Spawn 2cm Particle</button>
+                <button class="active" data-path="cross">Cross LoS</button>
+                <button data-path="interactive">Interactive (Drag)</button>
+            </div>
+
+            <div class="separator"></div>
+            <h2>Advanced Features</h2>
+
+            <label class="toggle" for="ofdmToggle">
+                <input type="checkbox" id="ofdmToggle">
+                <span class="slider"></span>
+                <span class="label-text">Enable OFDM (52 Subcarriers)</span>
+            </label>
+
+            <label class="toggle" for="multiPeerToggle">
+                <input type="checkbox" id="multiPeerToggle">
+                <span class="slider"></span>
+                <span class="label-text">Enable Multi-Peer (Tx2)</span>
+            </label>
+
+            <div class="separator"></div>
+            <h2>AI Transit Detection</h2>
+
+            <div class="button-group">
+                <button id="trainAiBtn" class="highlight" style="background-color: #ec4899; margin-bottom: 10px;">Train AI (Backend)</button>
+            </div>
+
+            <label class="toggle" for="aiPredictToggle">
+                <input type="checkbox" id="aiPredictToggle">
+                <span class="slider"></span>
+                <span class="label-text">Enable AI Transit Detection</span>
+            </label>
+
+            <div id="aiTransitPanel" style="margin-top: 15px; padding: 10px; border-radius: 8px; background: rgba(0,0,0,0.2); display: none;">
+                <div style="font-size: 14px; font-weight: bold; color: #9ca3af; margin-bottom: 5px;">STATUS</div>
+                <div id="aiStatusVal" style="font-size: 20px; font-weight: bold; color: #10b981;">CLEAR</div>
+                <div style="font-size: 14px; font-weight: bold; color: #9ca3af; margin-top: 10px; margin-bottom: 5px;">ESTIMATED SPEED</div>
+                <div id="aiSpeedVal" style="font-size: 20px; font-weight: bold; color: #3b82f6;">0 m/s</div>
+            </div>
+        </aside>
+    </div>
+    <script src="app.js"></script>
+</body>
+
+</html>

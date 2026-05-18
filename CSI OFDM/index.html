@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CSI Anomaly Detector — Multi-Object Presence Detection</title>
+    <meta name="description" content="Detect unknown objects by analyzing CSI interference patterns between satellite or ESP32 communication links. Background subtraction, CFAR detection, multi-link fusion.">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">ESP32 CSI / OFDM — Passive Radar PoC</p>
+          <h1>Multi-Object Anomaly Detector</h1>
+        </div>
+        <div class="status-strip" aria-live="polite">
+          <span id="roomName">Lab bench</span>
+          <span id="detectionStatus">No baseline</span>
+          <span id="detectionCount" class="badge-detect">0 detected</span>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <aside class="control-panel" aria-label="Simulation controls">
+          <!-- Room preset -->
+          <section class="panel-block">
+            <div class="panel-heading">
+              <h2>Environment</h2>
+              <span id="roomDimensions">6 × 4 × 3 m</span>
+            </div>
+            <select id="roomPreset" aria-label="Room preset">
+              <option value="lab">Lab bench</option>
+              <option value="classroom">Classroom</option>
+              <option value="warehouse">Warehouse</option>
+              <option value="orbit">Orbit-scale demo</option>
+            </select>
+          </section>
+
+          <!-- Multi-Object controls -->
+          <section class="panel-block">
+            <div class="panel-heading">
+              <h2>Objects</h2>
+              <button id="scatterObjects" type="button" title="Randomize all objects">↻</button>
+            </div>
+            <label>
+              Count
+              <input id="objectCount" type="range" min="0" max="8" step="1" value="3">
+              <output id="objectCountOut">3</output>
+            </label>
+            <label>
+              Reflectivity
+              <input id="reflectivity" type="range" min="0.05" max="1" step="0.01" value="0.56">
+              <output id="reflectivityOut">0.56</output>
+            </label>
+            <label>
+              Ambient noise
+              <input id="noise" type="range" min="0" max="0.3" step="0.005" value="0.04">
+              <output id="noiseOut">4.0%</output>
+            </label>
+            <label class="toggle-row">
+              Animate objects
+              <input id="animateTarget" type="checkbox">
+            </label>
+          </section>
+
+          <!-- Baseline / Detection -->
+          <section class="panel-block">
+            <div class="panel-heading">
+              <h2>Detection</h2>
+              <span id="baselineStatus">—</span>
+            </div>
+            <button id="captureBaseline" type="button" class="action-btn">📡 Capture Baseline (empty room)</button>
+            <button id="clearBaseline" type="button" class="action-btn secondary">✕ Clear Baseline</button>
+            <label>
+              CFAR σ
+              <input id="cfarThreshold" type="range" min="1.5" max="8" step="0.1" value="3.5">
+              <output id="cfarThresholdOut">3.5</output>
+            </label>
+            <label>
+              Guard cells
+              <input id="cfarGuard" type="range" min="1" max="6" step="1" value="2">
+              <output id="cfarGuardOut">2</output>
+            </label>
+            <label>
+              Min links
+              <input id="minLinks" type="range" min="1" max="6" step="1" value="1">
+              <output id="minLinksOut">1</output>
+            </label>
+          </section>
+
+          <!-- Receiver selector -->
+          <section class="panel-block">
+            <div class="panel-heading">
+              <h2>Link view</h2>
+              <span>CSI / CIR</span>
+            </div>
+            <div class="segmented six-col" role="group" aria-label="CSI link selector">
+              <button class="active" data-rx="0" type="button">Tx→R1</button>
+              <button data-rx="1" type="button">Tx→R2</button>
+              <button data-rx="2" type="button">Tx→R3</button>
+              <button data-rx="3" type="button">R1↔R2</button>
+              <button data-rx="4" type="button">R1↔R3</button>
+              <button data-rx="5" type="button">R2↔R3</button>
+            </div>
+          </section>
+
+          <!-- View controls -->
+          <section class="panel-block">
+            <div class="panel-heading">
+              <h2>View</h2>
+              <button id="resetView" type="button" title="Reset view">⌂</button>
+            </div>
+            <label>
+              Yaw
+              <input id="viewYaw" type="range" min="-180" max="180" step="1" value="-28">
+              <output id="viewYawOut">-28°</output>
+            </label>
+            <label>
+              Pitch
+              <input id="viewPitch" type="range" min="-70" max="70" step="1" value="24">
+              <output id="viewPitchOut">24°</output>
+            </label>
+            <label>
+              Zoom
+              <input id="viewZoom" type="range" min="0.55" max="2.4" step="0.01" value="1">
+              <output id="viewZoomOut">1.00x</output>
+            </label>
+            <label>
+              Pan X
+              <input id="viewPanX" type="range" min="-320" max="320" step="1" value="0">
+              <output id="viewPanXOut">0</output>
+            </label>
+            <label>
+              Pan Y
+              <input id="viewPanY" type="range" min="-240" max="240" step="1" value="0">
+              <output id="viewPanYOut">0</output>
+            </label>
+          </section>
+        </aside>
+
+        <!-- 3D Scene -->
+        <section class="scene-panel">
+          <canvas id="sceneCanvas" width="1100" height="720" aria-label="3D room and multi-object detection visualization"></canvas>
+          <div class="scene-legend" aria-hidden="true">
+            <span><i class="tx"></i> GPS Tx / Wi-Fi AP</span>
+            <span><i class="rx"></i> LEO Rx / ESP32</span>
+            <span><i class="obj"></i> true objects</span>
+            <span><i class="det"></i> detections</span>
+          </div>
+        </section>
+
+        <!-- Metrics & Charts -->
+        <section class="metrics-panel">
+          <!-- Detection summary -->
+          <article class="math-card">
+            <div class="panel-heading">
+              <h2>Detections</h2>
+              <span id="detectionSummary">—</span>
+            </div>
+            <div id="detectionList" class="detection-grid"></div>
+          </article>
+
+          <!-- Link metrics -->
+          <article class="math-card">
+            <div class="panel-heading">
+              <h2>Link Metrics</h2>
+              <span id="linkSummary">3 links</span>
+            </div>
+            <div id="receiverMetrics" class="metric-grid"></div>
+          </article>
+
+          <!-- Delta CSI -->
+          <article class="math-card">
+            <div class="panel-heading">
+              <h2>ΔH — CSI Anomaly</h2>
+              <span id="csiSummary">2.4 GHz / Link 1</span>
+            </div>
+            <canvas id="csiCanvas" width="760" height="230" aria-label="CSI anomaly plot showing baseline subtraction"></canvas>
+          </article>
+
+          <!-- Delta CIR with CFAR -->
+          <article class="math-card">
+            <div class="panel-heading">
+              <h2>ΔCIR — Peak Detection</h2>
+              <span id="delaySummary">—</span>
+            </div>
+            <canvas id="cirCanvas" width="760" height="210" aria-label="CIR plot with CFAR threshold overlay"></canvas>
+          </article>
+
+          <!-- Anomaly strength per link -->
+          <article class="math-card">
+            <div class="panel-heading">
+              <h2>Anomaly Strength</h2>
+              <span>per link</span>
+            </div>
+            <canvas id="anomalyCanvas" width="760" height="120" aria-label="Anomaly strength bar chart per link"></canvas>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script src="engine.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
